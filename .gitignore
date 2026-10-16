@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.env
+.env.*
+!.env.example
+*.log
+test_*.py
+test_results_*
+.DS_Store
+data/
+*.csv
+*.csv.gz
+*.parquet
+*.sqlite*

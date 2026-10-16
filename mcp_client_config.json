@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "physician-mimic": {
+      "command": "sh",
+      "args": [
+        "./run_mcp.sh"
+      ]
+    }
+  }
+}
