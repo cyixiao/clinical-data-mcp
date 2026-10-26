@@ -222,5 +222,77 @@ def get_patient_overview(subject_id: StrictInt, hadm_id: StrictInt | None = None
             "admissions": admissions, "unlinked_notes": unlinked}
 
 
+@mcp.tool(description="Get source records behind a patient or cohort result. evidence_type: patient, admissions, diagnoses or notes. Use the subject_id from the result; optionally select a hadm_id or one note_id (notes only). Returns original rows, source table names and full note text, with pagination.")
+def get_evidence(
+    subject_id: StrictInt,
+    evidence_type: str,
+    hadm_id: StrictInt | None = None,
+    note_id: str | None = None,
+    limit: StrictInt = 20,
+    offset: StrictInt = 0,
+) -> dict[str, Any]:
+    check_integer(subject_id, "subject_id")
+    check_integer(limit, "limit", maximum=100)
+    check_integer(offset, "offset", minimum=0, maximum=2**31 - 1)
+    evidence_type = evidence_type.strip().lower()
+    if evidence_type not in {"patient", "admissions", "diagnoses", "notes"}:
+        raise ValueError("evidence_type must be patient, admissions, diagnoses or notes.")
+    values = {"subject_id": subject_id, "fetch_limit": limit + 1, "offset": offset}
+    admission_filter = ""
+    if hadm_id is not None:
+        check_integer(hadm_id, "hadm_id")
+        values["hadm_id"] = hadm_id
+        admission_filter = " AND a.hadm_id = :hadm_id"
+    if note_id is not None:
+        note_id = note_id.strip()
+        if evidence_type != "notes" or not note_id:
+            raise ValueError("note_id must contain text and can only be used with notes.")
+        values["note_id"] = note_id
+
+    if evidence_type == "patient":
+        source_tables = ["patients"]
+        where = "p.subject_id = :subject_id"
+        if hadm_id is not None:
+            where += " AND EXISTS (SELECT 1 FROM admissions a WHERE a.subject_id = p.subject_id AND a.hadm_id = :hadm_id)"
+        sql = f"SELECT p.* FROM patients p WHERE {where} ORDER BY p.subject_id"
+    elif evidence_type == "admissions":
+        source_tables = ["admissions"]
+        sql = f"""
+            SELECT a.* FROM admissions a
+            WHERE a.subject_id = :subject_id {admission_filter}
+            ORDER BY a.admittime DESC NULLS LAST, a.hadm_id
+        """
+    elif evidence_type == "diagnoses":
+        source_tables = ["diagnoses_icd", "d_icd_diagnoses"]
+        sql = f"""
+            SELECT d.*, x.long_title AS diagnosis_name
+            FROM diagnoses_icd d JOIN admissions a
+              ON d.subject_id = a.subject_id AND d.hadm_id = a.hadm_id
+            LEFT JOIN d_icd_diagnoses x ON d.icd_code = x.icd_code AND d.icd_version = x.icd_version
+            WHERE d.subject_id = :subject_id {admission_filter}
+            ORDER BY d.hadm_id, d.seq_num, d.icd_version, d.icd_code
+        """
+    else:
+        source_tables = ["radiology", "discharge"]
+        where = "TRUE"
+        if hadm_id is not None:
+            where += " AND n.hadm_id = :hadm_id AND a.subject_id = n.subject_id"
+        if note_id is not None:
+            where += " AND n.note_id = :note_id"
+        sql = f"""
+            WITH notes AS ({NOTES_SQL})
+            SELECT n.*, {LINK_STATUS} AS admission_link_status
+            FROM notes n LEFT JOIN admissions a ON n.hadm_id = a.hadm_id
+            WHERE {where}
+            ORDER BY n.charttime DESC NULLS LAST, n.note_id
+        """
+    rows = query(sql + " LIMIT :fetch_limit OFFSET :offset", values)
+    has_more = len(rows) > limit
+    return {"subject_id": subject_id, "evidence_type": evidence_type, "source_tables": source_tables,
+            "requested_hadm_id": hadm_id, "requested_note_id": note_id, "records": rows[:limit],
+            "returned_count": min(len(rows), limit), "has_more": has_more,
+            "next_offset": offset + limit if has_more else None}
+
+
 if __name__ == "__main__":
     mcp.run(transport="stdio")
