@@ -15,7 +15,7 @@ from pydantic import StrictInt
 
 load_dotenv(Path(__file__).with_name(".env"))
 
-mcp = FastMCP("Physician MIMIC Tools")
+mcp = FastMCP("Clinical Data MIMIC Tools")
 
 NOTES_SQL = """
     SELECT 'radiology' AS note_category, * FROM radiology WHERE subject_id = :subject_id
@@ -292,6 +292,151 @@ def get_evidence(
             "requested_hadm_id": hadm_id, "requested_note_id": note_id, "records": rows[:limit],
             "returned_count": min(len(rows), limit), "has_more": has_more,
             "next_offset": offset + limit if has_more else None}
+
+
+def cohort_query(diagnosis_keyword, icd_code, icd_version, gender, min_age, max_age, start_date, end_date):
+    values, filters, diagnosis_filters = {}, [], []
+    if diagnosis_keyword is not None:
+        diagnosis_keyword = diagnosis_keyword.strip()
+        if not diagnosis_keyword:
+            raise ValueError("diagnosis_keyword must contain text, or use null to omit it.")
+        values["diagnosis_keyword"] = diagnosis_keyword
+        diagnosis_filters.append("instr(lower(x.long_title), lower(:diagnosis_keyword)) > 0")
+    if icd_code is not None:
+        icd_code = icd_code.strip().upper().replace(".", "")
+        if not re.fullmatch(r"[A-Z0-9]{1,7}", icd_code) or icd_version is None:
+            raise ValueError("icd_code must be an ICD code with icd_version set to 9 or 10.")
+        values["icd_code"] = icd_code
+        diagnosis_filters.append("d.icd_code = :icd_code")
+    if icd_version is not None:
+        check_integer(icd_version, "icd_version", minimum=9, maximum=10)
+        values["icd_version"] = icd_version
+        diagnosis_filters.append("d.icd_version = :icd_version")
+    if diagnosis_filters:
+        filters.append(f"""EXISTS (
+            SELECT 1 FROM diagnoses_icd d
+            LEFT JOIN d_icd_diagnoses x ON d.icd_code = x.icd_code AND d.icd_version = x.icd_version
+            WHERE d.subject_id = a.subject_id AND d.hadm_id = a.hadm_id
+              AND {' AND '.join(diagnosis_filters)}
+        )""")
+    if gender is not None:
+        gender = gender.strip().upper()
+        if gender not in {"F", "M"}:
+            raise ValueError("gender must be F or M.")
+        values["gender"] = gender
+        filters.append("p.gender = :gender")
+    age = "p.anchor_age + year(a.admittime) - p.anchor_year"
+    for name, value, operator in [("min_age", min_age, ">="), ("max_age", max_age, "<=")]:
+        if value is not None:
+            check_integer(value, name, minimum=0, maximum=120)
+            values[name] = value
+            filters.append(f"({age}) {operator} :{name}")
+    if min_age is not None and max_age is not None and min_age > max_age:
+        raise ValueError("min_age must be on or below max_age.")
+    for name, value, operator in [("start_date", start_date, ">="), ("end_date", end_date, "<=")]:
+        if value is not None:
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+                raise ValueError(f"{name} must use YYYY-MM-DD.")
+            date.fromisoformat(value)
+            values[name] = value
+            filters.append(f"CAST(a.admittime AS DATE) {operator} CAST(:{name} AS DATE)")
+    if start_date and end_date and start_date > end_date:
+        raise ValueError("start_date must be on or before end_date.")
+    where = " AND ".join(filters) or "TRUE"
+    sql = f"""WITH cohort AS (
+        SELECT a.subject_id, a.hadm_id, p.gender, p.anchor_age, p.anchor_year,
+               {age} AS age_at_admission, p.anchor_age = 91 AS age_top_coded,
+               a.admittime, a.dischtime, a.admission_type
+        FROM admissions a JOIN patients p ON a.subject_id = p.subject_id
+        WHERE {where}
+    )"""
+    return sql, values
+
+
+@mcp.tool(description="Find a research cohort, one row per matching admission, with patient and admission IDs. Filter by diagnosis dictionary wording (literal substring), exact ICD code plus version, F/M gender, approximate age at admission, or inclusive admission dates (YYYY-MM-DD). All filters apply to the same admission. Ages use anchor_age + admission year - anchor_year; age_top_coded marks patients whose anchor age was replaced with 91. Results are paginated; use the same filters with get_cohort_overview for full-cohort statistics.")
+def search_cohort(
+    diagnosis_keyword: str | None = None,
+    icd_code: str | None = None,
+    icd_version: StrictInt | None = None,
+    gender: str | None = None,
+    min_age: StrictInt | None = None,
+    max_age: StrictInt | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    limit: StrictInt = 20,
+    offset: StrictInt = 0,
+) -> dict[str, Any]:
+    check_integer(limit, "limit", maximum=100)
+    check_integer(offset, "offset", minimum=0, maximum=2**31 - 1)
+    sql, values = cohort_query(diagnosis_keyword, icd_code, icd_version, gender,
+                               min_age, max_age, start_date, end_date)
+    rows = query(sql + """
+        SELECT * FROM cohort ORDER BY subject_id, hadm_id LIMIT :fetch_limit OFFSET :offset
+    """, values | {"fetch_limit": limit + 1, "offset": offset})
+    has_more = len(rows) > limit
+    return {"filters": values, "admissions": rows[:limit], "returned_count": min(len(rows), limit),
+            "has_more": has_more, "next_offset": offset + limit if has_more else None}
+
+
+@mcp.tool(description="Summarize the entire research cohort using the same filters as search_cohort. Returns distinct patient and admission counts, gender counts by patient, approximate age statistics by admission, admission dates, the ten most frequent coded diagnoses, and note counts/dates for matching admissions only. Diagnosis keywords search dictionary wording; codes match exactly with their version. Ages use anchor_age + admission year - anchor_year, including the deidentified 91 age group. Dates filter admission dates, not note dates. Omit filters to summarize all admissions with a patient record.")
+def get_cohort_overview(
+    diagnosis_keyword: str | None = None,
+    icd_code: str | None = None,
+    icd_version: StrictInt | None = None,
+    gender: str | None = None,
+    min_age: StrictInt | None = None,
+    max_age: StrictInt | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> dict[str, Any]:
+    sql, values = cohort_query(diagnosis_keyword, icd_code, icd_version, gender,
+                               min_age, max_age, start_date, end_date)
+    summary = query(sql + """
+        SELECT count(DISTINCT subject_id) AS patient_count, count(*) AS admission_count,
+               min(admittime) AS first_admission_date, max(admittime) AS last_admission_date,
+               count(age_at_admission) AS admissions_with_age,
+               min(age_at_admission) AS min_age_at_admission,
+               max(age_at_admission) AS max_age_at_admission,
+               avg(age_at_admission) AS mean_age_at_admission,
+               count(DISTINCT CASE WHEN age_top_coded THEN subject_id END) AS age_top_coded_patient_count
+        FROM cohort
+    """, values)[0]
+    if summary["mean_age_at_admission"] is not None:
+        summary["mean_age_at_admission"] = float(summary["mean_age_at_admission"])
+    genders = query(sql + """
+        SELECT gender, count(DISTINCT subject_id) AS patient_count
+        FROM cohort GROUP BY gender ORDER BY gender NULLS LAST
+    """, values)
+    diagnoses = query(sql + """
+        SELECT d.icd_code, d.icd_version, x.long_title AS diagnosis_name,
+               count(DISTINCT d.subject_id) AS patient_count,
+               count(DISTINCT d.hadm_id) AS admission_count
+        FROM cohort c JOIN diagnoses_icd d ON c.subject_id = d.subject_id AND c.hadm_id = d.hadm_id
+        LEFT JOIN d_icd_diagnoses x ON d.icd_code = x.icd_code AND d.icd_version = x.icd_version
+        GROUP BY d.icd_code, d.icd_version, x.long_title
+        ORDER BY patient_count DESC, admission_count DESC, d.icd_version, d.icd_code
+        LIMIT 10
+    """, values)
+    note_groups = query(sql + """, notes AS (
+        SELECT 'radiology' AS note_category, n.subject_id, n.hadm_id, n.charttime
+        FROM radiology n JOIN cohort c ON n.subject_id = c.subject_id AND n.hadm_id = c.hadm_id
+        UNION ALL
+        SELECT 'discharge' AS note_category, n.subject_id, n.hadm_id, n.charttime
+        FROM discharge n JOIN cohort c ON n.subject_id = c.subject_id AND n.hadm_id = c.hadm_id
+    )
+        SELECT note_category, count(*) AS note_count,
+               count(DISTINCT subject_id) AS patient_count, count(DISTINCT hadm_id) AS admission_count,
+               min(charttime) AS first_note_date, max(charttime) AS last_note_date
+        FROM notes GROUP BY note_category ORDER BY note_category
+    """, values)
+    notes_by_type = {kind: {"note_count": 0, "patient_count": 0, "admission_count": 0,
+                            "first_note_date": None, "last_note_date": None}
+                     for kind in ("radiology", "discharge")}
+    for group in note_groups:
+        notes_by_type[group.pop("note_category")] = group
+    return {"filters": values, **summary, "patients_by_gender": genders,
+            "top_diagnoses": diagnoses, "notes_by_type": notes_by_type,
+            "note_scope": "Notes linked to matching admissions by both subject_id and hadm_id."}
 
 
 if __name__ == "__main__":
